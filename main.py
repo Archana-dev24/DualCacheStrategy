@@ -6,7 +6,7 @@ import redis
 from dotenv import load_dotenv
 from groq import Groq
 
-from CacheWrapper import DualCache, L1HashCache, L2SemanticCache
+from CacheWrapper import DualCache, L1HashCache, L2SemanticCache, configure_eviction
 
 load_dotenv()
 
@@ -22,8 +22,10 @@ REDIS_HOST     = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT     = int(os.getenv("REDIS_PORT", 6379))
 L1_TTL         = int(os.getenv("L1_TTL", 3600))       # 1 hour  — exact matches
 L2_TTL         = int(os.getenv("L2_TTL", 86400))      # 24 hours — semantic matches
-L2_THRESHOLD   = float(os.getenv("L2_THRESHOLD", 0.15))
-GROQ_MODEL     = "llama-3.3-70b-versatile"
+L2_THRESHOLD          = float(os.getenv("L2_THRESHOLD", 0.15))
+REDIS_MAX_MEMORY      = os.getenv("REDIS_MAX_MEMORY", "256mb")
+REDIS_EVICTION_POLICY = os.getenv("REDIS_EVICTION_POLICY", "volatile-lru")
+GROQ_MODEL            = "llama-3.3-70b-versatile"
 
 # ── Shared Redis connection ─────────────────────────────────────────────────────
 redis_client = redis.Redis(
@@ -33,6 +35,11 @@ redis_client = redis.Redis(
     socket_connect_timeout=2,
     socket_timeout=2,
 )
+
+# ── Auto-eviction when memory is full ──────────────────────────────────────────
+# Redis will automatically drop least-recently-used TTL keys under memory pressure.
+# Override via env: REDIS_MAX_MEMORY=512mb  REDIS_EVICTION_POLICY=volatile-lfu
+configure_eviction(redis_client, max_memory=REDIS_MAX_MEMORY, policy=REDIS_EVICTION_POLICY)
 
 # ── Build dual cache ────────────────────────────────────────────────────────────
 l1    = L1HashCache(client=redis_client, ttl=L1_TTL)
@@ -56,8 +63,8 @@ def call_llm(question: str) -> str:
             },
             {"role": "user", "content": question},
         ],
-        temperature=0.3,
-        max_completion_tokens=256,
+        temperature=0.9,
+        max_completion_tokens=1024,
     )
     return completion.choices[0].message.content.strip()
 

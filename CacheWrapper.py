@@ -11,6 +11,53 @@ from redisvl.utils.vectorize import HFTextVectorizer
 
 logger = logging.getLogger(__name__)
 
+# Eviction policies that make sense for a cache workload
+_VALID_POLICIES = {
+    "volatile-lru",     # evict LRU keys that have a TTL  (default — safest)
+    "volatile-lfu",     # evict LFU keys that have a TTL
+    "volatile-ttl",     # evict keys closest to expiry first
+    "volatile-random",  # evict random TTL keys
+    "allkeys-lru",      # evict any LRU key regardless of TTL
+    "allkeys-lfu",      # evict any LFU key regardless of TTL
+    "allkeys-random",   # evict any random key
+    "noeviction",       # return error on write when full (not recommended for cache)
+}
+
+
+def configure_eviction(
+    client: redis.Redis,
+    max_memory: str = "256mb",
+    policy: str = "volatile-lru",
+) -> dict:
+    """
+    Apply Redis maxmemory + eviction policy so the cache self-manages under memory pressure.
+
+    When memory hits max_memory Redis will automatically evict entries according
+    to the chosen policy before accepting new writes — no application logic needed.
+
+    Args:
+        client:     shared Redis connection
+        max_memory: size string Redis understands, e.g. "256mb", "1gb", "0" (unlimited)
+        policy:     one of volatile-lru (default), volatile-lfu, volatile-ttl,
+                    allkeys-lru, allkeys-lfu, allkeys-random, noeviction
+
+    Returns:
+        dict with the active maxmemory and maxmemory-policy values confirmed from Redis
+    """
+    if policy not in _VALID_POLICIES:
+        raise ValueError(f"Unknown eviction policy '{policy}'. Valid options: {sorted(_VALID_POLICIES)}")
+
+    client.config_set("maxmemory", max_memory)
+    client.config_set("maxmemory-policy", policy)
+
+    active = client.config_get(["maxmemory", "maxmemory-policy"])
+    logger.info(
+        "Redis eviction configured — maxmemory=%s  policy=%s",
+        active.get("maxmemory", "?"),
+        active.get("maxmemory-policy", "?"),
+    )
+    return active
+
 
 @dataclass
 class CacheResult:
@@ -67,7 +114,7 @@ class L2SemanticCache:
     def __init__(
         self,
         client: redis.Redis,
-        ttl: int = 86400,
+        ttl: int = 3600,
         distance_threshold: float = 0.15,
         index_name: str = "dual-l2-cache",
     ):
@@ -141,8 +188,20 @@ class DualCache:
         self.l2.set(query, response)
 
     def stats(self) -> dict:
+        mem_info  = self.l1.client.info("memory")
+        evict_cfg = self.l1.client.config_get(["maxmemory", "maxmemory-policy"])
+
+        used_mb  = mem_info["used_memory"] / 1024 / 1024
+        max_bytes = int(evict_cfg.get("maxmemory", 0))
+        max_mb    = max_bytes / 1024 / 1024 if max_bytes > 0 else None
+        used_pct  = (used_mb / max_mb * 100) if max_mb else None
+
         return {
-            "l1_entries": self.l1.size(),
-            "l1_ttl_seconds": self.l1.ttl,
-            "l2_threshold": self.l2._cache.distance_threshold,
+            "l1_entries":       self.l1.size(),
+            "l1_ttl_seconds":   self.l1.ttl,
+            "l2_threshold":     self.l2._cache.distance_threshold,
+            "memory_used_mb":   round(used_mb, 2),
+            "memory_max_mb":    round(max_mb, 2) if max_mb else "unlimited",
+            "memory_used_pct":  f"{used_pct:.1f}%" if used_pct is not None else "n/a",
+            "eviction_policy":  evict_cfg.get("maxmemory-policy", "unknown"),
         }
